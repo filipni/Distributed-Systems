@@ -1,0 +1,36 @@
+# This is the main logic and behaviour of the byzantine 
+# vessel in each stage.
+#
+# This is just a modified version that actually communicates
+# with the other vessels using the same logic that were
+# provided by the TAs.
+
+#Compute and send byzantine votes for round 1, by trying to create
+#a split decision.
+def byzantine_stage1(source):
+  for i, (ip, port) in enumerate(mycontext['neighbors']):
+    to_send = 'ATTACK'
+    if i % 2 == 0:
+      to_send = 'RETREAT'
+    params = {'vote':to_send,'source':source}
+    byzantine_send(ip, port, '/result/stage1', params)
+
+
+#Compute and send byzantine votes for round 2, trying to swing the decision
+#on different directions for different nodes.
+def byzantine_stage2(ips):
+  for i, (ip, port) in enumerate(mycontext['neighbors']):
+    to_send = ['ATTACK'] * mycontext['num_nodes']
+    if i % 2 == 0:
+      to_send = ['RETREAT'] * mycontext['num_nodes']
+    params = {'votes':_encode_list(to_send),'ips':_encode_list(ips)}
+    byzantine_send(ip, port, '/result/stage2', params)
+
+
+def byzantine_send(ip, port, path, params):
+  request_body = http_generate_body_from_dict(params)
+  request = http_generate_request('POST', path, request_body)
+  try:
+    http_send(ip, port, request)
+  except Exception, e:
+    log('neighbor %s:%d is down' % (ip, int(port)))

@@ -1,0 +1,369 @@
+include http-utils.repy
+include http-server.repy
+
+# ------------------------------------------------------------------------------
+# GET /board & /
+#   Handles initial GET request from browser
+# ------------------------------------------------------------------------------
+def get_board_handler(sockobj, params, query_params):
+  entries = fmap_lock('entries_lock', get_entries, []).items()
+  entries.sort(sort_entries)
+  res = generate_html_response(map(get_second_tuple, entries))
+  sockobj.send(res)
+
+
+# ------------------------------------------------------------------------------
+# Returns the second element of a tuple
+# ------------------------------------------------------------------------------
+def get_second_tuple(tuple):
+  return tuple[1]
+
+
+# ------------------------------------------------------------------------------
+# Compares two sort-entries, assuming they are a list of tuples
+# like [(id, entry)]
+#   - splits the id into LC + IP
+#       sorts with priority on LC, and second-case IP
+# ------------------------------------------------------------------------------
+def sort_entries(A, B):
+  ipA, lcA = A[0].split('+')
+  ipB, lcB = B[0].split('+')
+
+  if int(lcA) == int(lcB):
+    return compare(ipA, ipB)
+  else:
+    return compare(int(lcA), int(lcB))
+
+
+# ------------------------------------------------------------------------------
+# compares 'a' and 'b' - assuming that their types
+# are able to be ordered.
+# ------------------------------------------------------------------------------
+def compare(a, b):
+  if a < b:
+    return -1
+  elif a == b:
+    return 0
+  else:
+    return 1
+
+# ------------------------------------------------------------------------------
+# POST /entries
+#   Leader adds new entry to blackboard and broadcasts this entry to all other nodes 
+# ------------------------------------------------------------------------------
+def new_entry_handler(sockobj, params, query_params):
+  lc = fmap_lock('clock_lock', inc_clock, []) 
+
+  # The new entry id
+  id = '%s:%s+%s' % (mycontext['ip'], str(mycontext['port']), str(lc))
+  request = {'type':'ADD','lc':lc,'ip':mycontext['ip'],'port':mycontext['port'],'id':id}
+  request.update(params)
+
+  http_broadcast('PUT', '/update', request)
+
+  updates = fmap_lock('update_queue_lock', append_update, [id, request])
+  fmap_lock('entries_lock', replay_entry, [id, updates])
+
+  sockobj.send(make_http_response(200, 'OK', ''))
+  
+
+# ------------------------------------------------------------------------------
+# POST /entries/:id
+#   Modifies or deletes an already existing entry and
+#   broadcasts the changes to all other nodes
+# ------------------------------------------------------------------------------
+def modify_entry_handler(sockobj, params, query_params):
+  lc = fmap_lock('clock_lock', inc_clock, []) 
+  id = query_params[-1]
+
+  updateType = 'MODIFY'
+  if params['delete'] == '1':
+    updateType = 'DELETE'
+
+  request = {'type':updateType,'lc':lc,'ip':mycontext['ip'],'port':mycontext['port']}
+  request.update(params)
+  request['id'] = id
+
+  http_broadcast('PUT', '/update', request)
+
+  updates = fmap_lock('update_queue_lock', append_update, [id, request])
+  fmap_lock('entries_lock', replay_entry, [id, updates])
+
+  sockobj.send(make_http_response(200, 'OK', ''))
+
+
+# ------------------------------------------------------------------------------
+# PUT /update
+#   Process an incoming update from another vessel and add it to our
+#   queue.
+# ------------------------------------------------------------------------------
+def update_handler(sockobj, params, query_params):
+  update_lc = int(params['lc'])
+  fmap_lock('clock_lock', correct_clock, [update_lc])
+    
+  id = params['id']
+  updates = fmap_lock('update_queue_lock', append_update, [id, params])
+  fmap_lock('entries_lock', replay_entry, [id, updates])
+  
+  sockobj.send(make_http_response(200, 'OK', ''))
+
+
+# ------------------------------------------------------------------------------
+# Appends a new update to the update-queue and resolves conflicts
+# if and when they occur.
+#   NOTE: not thread-safe
+# ------------------------------------------------------------------------------
+def append_update(id, request):
+  updates = mycontext['update_queue']
+  update_lc = int(request['lc'])
+  request['lc'] = update_lc
+
+  if not id in updates:
+    # This is the first, just create an empty list!
+    mycontext['update_queue'][id] = [request]
+  else:
+    # determine where to insert this update
+    # in the queue
+    insert_index = None
+    for index, params in enumerate(updates[id]):
+      lc = int(params['lc'])
+      if lc == update_lc:
+        if compare_sources(params, request):
+          insert_index = index
+          break
+      elif lc > update_lc:
+        insert_index = index
+        break
+
+    if insert_index == None:
+      mycontext['update_queue'][id].append(request)
+    else:
+      mycontext['update_queue'][id].insert(insert_index, request)
+
+  
+  return mycontext['update_queue'][id]
+
+
+# ------------------------------------------------------------------------------
+# Compares two parameters/updates/events to each other.
+#   In this case A against B.
+#   Returns:
+#       0 == they are either equal or A is greater
+#       1 == B is greater
+# ------------------------------------------------------------------------------
+def compare_sources(paramsA, paramsB):
+  ipA = paramsA['ip']
+  portA = paramsA['port']
+
+  ipB = paramsB['ip']
+  portB = paramsB['port']
+
+  # same source (running locally) => same ip
+  if ipA == ipB:
+    return int(portA) < int(portB)
+  else:
+    # compare the ip-addresses alpha-numerical
+    #   it's deterministic on all vessels - all that matters.
+    return ipA < ipB
+
+
+# ------------------------------------------------------------------------------
+# Appends a new update to the update-queue and resolves conflicts
+# if and when they occur.
+#   NOTE: not thread-safe (lock 'entries_lock')
+# ------------------------------------------------------------------------------
+def replay_entry(id, updates):
+  # remove the former entry representation
+  mycontext['entries'][id] = None
+
+  # replay the entire update-history for this specific entry
+  for params in updates:
+    updateType = params['type']
+    if updateType == 'ADD':
+      add_entry(id, params['entry'])
+    elif updateType == 'MODIFY':
+      modify_entry(id, params['entry'])
+    elif updateType == 'DELETE':
+      delete_entry(id)
+      break
+
+
+# ------------------------------------------------------------------------------
+# Adds an entirely new entry to the entries list
+# ------------------------------------------------------------------------------
+def add_entry(id, text):
+  entry = mycontext['entry_template'] % ('entries/%s' % (id), id, text)
+  mycontext['entries'][id] = entry
+
+
+# ------------------------------------------------------------------------------
+# Deletes an entry with a specific id from the entries list.
+#   NOTE: not thread-safe
+# ------------------------------------------------------------------------------
+def delete_entry(id):
+  if id in mycontext['entries']:
+    del mycontext['entries'][id]
+
+
+# ------------------------------------------------------------------------------
+# Modifies an already existing entry in the entries list
+#   NOTE: not thread-safe
+# ------------------------------------------------------------------------------
+def modify_entry(id, text):
+  if id in mycontext['entries']:
+    mycontext['entries'][id] = mycontext['entry_template'] % ('entries/%s' % (id), id, text)
+
+
+# ------------------------------------------------------------------------------
+# Clears all entries and resets the msgid counter
+#   NOTE: not thread-safe
+# ------------------------------------------------------------------------------
+def get_entries():
+  return mycontext['entries']
+
+
+# ------------------------------------------------------------------------------
+# Corrects the current global clock after received clock value
+#   NOTE: not thread-safe
+# ------------------------------------------------------------------------------
+def correct_clock(update_lc):
+  lc = mycontext['clock']
+  if update_lc > lc:
+    lc = update_lc + 1
+  else:
+    lc = lc + 1
+  mycontext['clock'] = lc
+
+
+# ------------------------------------------------------------------------------
+# Increases the current clock value and returns the new clock-value
+#   NOTE: not thread-safe
+# ------------------------------------------------------------------------------
+def inc_clock():
+  clock = mycontext['clock'] = mycontext['clock'] + 1
+  return clock
+
+
+# ------------------------------------------------------------------------------
+# Function map with safe surrounding lock acquiring and release
+# ------------------------------------------------------------------------------
+def fmap_lock(lockName, func, params):
+  mycontext[lockName].acquire()
+  retVal = None
+  try:
+    retVal = func(*params)
+  except Exception, e:
+    log("Exception in critical section (lock %s): %s, %s\n" %(lockName, type(e), e))
+  finally:
+    mycontext[lockName].release()
+    return retVal
+
+
+# ------------------------------------------------------------------------------
+# Log a message with extra relevant information - such as the current ip+port
+# in order to distinguish a difference between what each vessel/machine logs.
+# ------------------------------------------------------------------------------
+def log(s):
+  print '%f %s:%i@> %s' % (getruntime(), mycontext['ip'], mycontext['port'], s)
+
+
+# ------------------------------------------------------------------------------
+# Parses the neighborlist file and detects neighbors
+#   NOTE: assumes that mycontext['ip'] and mycontext['port'] is set.
+# ------------------------------------------------------------------------------
+def read_neighbors_from_file(filename):
+  f = open(filename, 'r')
+
+  neighbors = []
+  for line in f:
+    addr_info = line.split(':')
+    ip = addr_info[0]
+    port = int(addr_info[1].rstrip())
+    neighbors.append( (ip, port) )
+
+  f.close()
+  return neighbors
+
+
+# ------------------------------------------------------------------------------
+# Emulates the behaviour of python built-in enumerate, but tailor-made
+# to work in repy.
+# ------------------------------------------------------------------------------
+def enumerate(sequence, start=0):
+  n = start
+  ret = []
+  for elem in sequence:
+    ret.append((n, elem))
+    n += 1
+
+  return ret
+
+
+# ------------------------------------------------------------------------------
+# Initalizes global variables and calls start_board() to start listening for conns
+# ------------------------------------------------------------------------------
+def init():
+  # Check the number of arguments given
+  if len(callargs) == 1 or len(callargs) == 2:
+    port = int(callargs[0])
+    if len(callargs) == 2:
+      ip=str(callargs[1])
+    else:
+      try:
+        ip = getmyip()
+      except Exception, e:
+        print "Could not get an IP\n"
+        print (type(e), e)
+        raise
+  else:
+    raise Exception("Usage: python <path to repy.py> <path to restrictions.default> skeleton2016.repy <port> [ip (optional)]")
+
+  # This dictionary will hold all the messages posted to the blackboard
+  mycontext['entries'] = {}
+  mycontext['entries_lock'] = getlock()
+
+  mycontext['port'] = port
+  mycontext['ip'] = ip
+  mycontext['neighbors'] = read_neighbors_from_file('neighborlist.txt')
+
+  # Read and store the ip and port number of neighbors
+  mycontext['authors'] = "Filip Nilsson (filipni(at)student), Sebastian Lund (selund(at)student)"
+
+  mycontext['clock'] = 0
+  mycontext['clock_lock'] = getlock()
+
+  # Keeps track of received updates
+  mycontext['update_queue'] = {}
+  mycontext['update_queue_lock'] = getlock()
+
+  load_templates()
+
+  http_server_init()
+
+  # Primary board http handlers
+  http_server_register_handler('GET', '/', get_board_handler)
+  http_server_register_handler('GET', '/board', get_board_handler)
+  http_server_register_handler('POST', '/entries', new_entry_handler)
+  http_server_register_handler('POST', '/entries/:id', modify_entry_handler)
+
+  http_server_register_handler('PUT', '/update', update_handler)
+
+  http_server_start()
+
+
+# ------------------------------------------------------------------------------
+# Load all html templates into mycontext
+# ------------------------------------------------------------------------------
+def load_templates():
+  # Read html template files
+  mycontext['response_template'] = file("response_template.html").read()
+  mycontext['entry_template'] = file("entry_template.html").read()
+  mycontext['boardcontents_template'] = file("boardcontents_template.html").read()
+  mycontext['frontpage_header_template'] = file("board_frontpage_header_template.html").read()
+  mycontext['frontpage_footer_template'] = file("board_frontpage_footer_template.html").read()
+
+# ------------------------------------------------------------------------------
+# Main entry point of the program.
+# ------------------------------------------------------------------------------
+if callfunc == 'initialize':
+  init()

@@ -1,0 +1,62 @@
+# ------------------------------------------------------------------------------
+# Returns the parameters found in the body of a HTTP request as a dictionary 
+# ------------------------------------------------------------------------------
+def extract_params_from_body(msg):
+  query = extract_http_request_contents(msg)
+  return extract_parameters_from_query(query)
+
+# ------------------------------------------------------------------------------
+# Generates a HTTP response indicating success or failure
+# ------------------------------------------------------------------------------
+def generate_response(msgheader, success):
+  if success:
+    htmlresponse = mycontext['response_template'] % ("green", "200 OK\n" + msgheader)
+    return make_http_response(200, 'OK', htmlresponse)
+  else:
+    htmlresponse = mycontext['response_template'] % ("red", "400 Bad Request\n" + msgheader)
+    return make_http_response(400, 'Bad Request', htmlresponse)
+
+# ------------------------------------------------------------------------------
+# Wrap into HTTP headers
+# ------------------------------------------------------------------------------
+def make_http_response(status, status_text, htmlresponse):
+    response_template = "HTTP/1.1 %d %s\r\nContent-type: text/html\r\nContent-length: %i\r\n\r\n%s"
+    return response_template % (status, status_text, len(htmlresponse), htmlresponse)
+
+# ------------------------------------------------------------------------------
+# Utility function to extract the contents (payload) from HTTP request
+# ------------------------------------------------------------------------------
+def extract_http_request_contents(header):
+  # Find content length
+  conent_length = header.split('Content-Length: ')[1]
+  conent_length = int(conent_length.split('\r\n')[0])
+  # Extract the http response body and discard the header
+  return header[-conent_length:]
+
+# ------------------------------------------------------------------------------
+# Utility function to extract query parameter from HTML query
+# ------------------------------------------------------------------------------
+def extract_parameters_from_query(msg):
+  # Extract the query parameters as a dictionary: {name:value}
+  # Example input format: comment=aa&ip=127.0.0.1&port=63101&action=Delete
+  parameters={}
+  arr = msg.split('&')
+  for a in arr:
+    pp = a.split('=')
+    if len(pp)>1:
+      parameters[pp[0]] = pp[1]
+  return parameters
+
+# ------------------------------------------------------------------------------
+# Outputs the blackboard html 
+# ------------------------------------------------------------------------------   
+def generate_html_response():
+  entries = "".join(mycontext['entries'].values())
+  # Dynamic title showing Ip address, port and up time. 
+  title='Sample board @ %s:%d. Up time: %d' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
+  content = mycontext['boardcontents_template'] %( title, entries )
+  fullpage_h = mycontext['frontpage_header_template'] + content
+  fullpage = fullpage_h + mycontext['frontpage_footer_template'] % mycontext['authors']
+  # Wrap the full HTML page in in a HTTP header
+  return make_http_response(200, 'OK', fullpage)
+

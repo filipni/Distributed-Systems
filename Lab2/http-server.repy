@@ -1,0 +1,99 @@
+# ------------------------------------------------------------------------------
+# Initializes the global variables used by the http-server
+# ------------------------------------------------------------------------------
+def http_server_init():
+  mycontext['routes'] = []
+
+# ------------------------------------------------------------------------------
+# Start listening and handle incoming connections in board() function
+# ------------------------------------------------------------------------------
+def http_server_start():
+  ip = mycontext['ip']
+  port = mycontext['port']
+  print "Listening on IP " + str(ip) + " port " + str(port)
+  try:
+    listencommhandle = waitforconn(ip, port, _connection_handler)
+  except Exception, e:
+    print "Exception in http_start_server: %s, %s\n" %(type(e), e)
+    raise
+
+
+# ------------------------------------------------------------------------------
+# Called when an incoming message is received.
+# ------------------------------------------------------------------------------
+def _connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle):
+  try:
+    msg = sockobj.recv(1024)
+    method, action = _get_method_and_action(msg)
+
+    for route in mycontext['routes']:
+      (route_method, route_path, route_handler) = route
+      if method == route_method and http_match_paths(action, route_path):
+        params = extract_params_from_body(msg)
+        route_handler(sockobj, params, action.split('/'))
+        break
+  except Exception, e:
+    print "Exception in board: %s, %s\n" %(type(e), e)
+    make_http_response(400, 'Bad Request', str(e))
+  finally:
+    stopcomm(thiscommhandle)
+
+# ------------------------------------------------------------------------------
+# Returns method and action from HTTP request
+# ------------------------------------------------------------------------------
+def _get_method_and_action(msg):
+  split = msg.split(' ', 2)
+  return (split[0], split[1])
+
+
+# ------------------------------------------------------------------------------
+# Register a handler for a specific route (method + path)
+# ------------------------------------------------------------------------------
+def http_server_register_handler(method, path, handler):
+  mycontext['routes'].append((method, path, handler))
+
+
+# ------------------------------------------------------------------------------
+# Send a http packet to a specific ip and port
+# ------------------------------------------------------------------------------
+def http_send(ip, port, msg):
+  socket = openconn(ip, port)
+  socket.send(msg)
+  socket.close()
+
+
+# ------------------------------------------------------------------------------
+# Split two HTTP paths and determine if they are a match or not.
+# This handles arbitrary path-elements as variables as well!
+# Example:
+#   /entries/12 matches /entries/:id
+#   /entries does not match /entries/
+#   /entries/12/update matches /entries/:id/update
+# ------------------------------------------------------------------------------
+def http_match_paths(a, b):
+  partsA = a.split('/')
+  partsB = b.split('/')
+
+  # Special case if it's the root (ie a == / or b == /)
+  # if not - generates an error on ex /board and /
+  if (a == '/' and b != '/') or (b == '/' and a != '/'):
+    return False
+
+  # Length should correspond
+  if len(partsA) != len(partsB):
+    return False
+
+  # Check each part against each other
+  for i in range(0, len(partsA)):
+    if len(partsA[i]) == 0 and len(partsB[i]) == 0:
+      continue
+
+    # We allow arbitrary variables (such as /entries/:id) to match
+    # on any arbitrary string
+    is_variable = (partsA[i][0] == ':' or partsB[i][0] == ':')
+    matches = partsA[i] == partsB[i]
+    if not matches and not is_variable:
+      return False
+
+  # If we reached this part, all should be well!
+  return True

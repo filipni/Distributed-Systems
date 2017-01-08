@@ -1,0 +1,198 @@
+# ------------------------------------------------------------------------------
+# Initialize the variables and stuff needed for the leader-election
+# algorithm.
+# ------------------------------------------------------------------------------
+def leader_election_init():
+  mycontext['leader'] = None 
+  mycontext['leader_lock'] = getlock()
+
+  mycontext['id'] = int(randomfloat() * 10000)
+  mycontext['neighbor_ids'] = [ mycontext['id'] ]
+
+  http_server_register_handler('POST', '/leader/election', election_handler)
+  http_server_register_handler('POST', '/leader/coordinate', coordinate_handler)
+
+  settimer(2, _leader_election_start, [])
+
+
+# ------------------------------------------------------------------------------
+# Resets the leader and starts a new leader-election process
+# ------------------------------------------------------------------------------
+def leader_election_reset():
+  leader_elect(None, None)
+  _leader_election_start()
+
+
+# ------------------------------------------------------------------------------
+# Starts a new leader-election process
+# ------------------------------------------------------------------------------
+def _leader_election_start():
+  source = "%s:%i" % (mycontext['ip'], mycontext['port'])
+  _election_propagate(source, [mycontext['id']], [source])
+
+
+# ------------------------------------------------------------------------------
+# Returns a boolean whether or whether not a leader has been elected.
+# ------------------------------------------------------------------------------
+def leader_election_is_done():
+  return fmap_lock('leader_lock', _is_done, [])
+
+# NOTE: helper function - not thread-safe!
+def _is_done():
+  return mycontext['leader'] is not None
+
+
+# ------------------------------------------------------------------------------
+# Returns a boolean whether the current node is the selected leader
+# ------------------------------------------------------------------------------
+def is_leader():
+  return fmap_lock('leader_lock', _is_leader, [])
+
+# NOTE: helper function - not thread-safe!
+def _is_leader():
+  return mycontext['leader'] == mycontext['id']
+
+
+# ------------------------------------------------------------------------------
+# Sets the corresponding id+ip as the new leader
+# ------------------------------------------------------------------------------
+def leader_elect(id, ip):
+  fmap_lock('leader_lock', _set_leader, [id, ip])
+
+# NOTE: helper function - not thread-safe!
+def _set_leader(id, ip):
+  mycontext['leader'] = id
+  mycontext['leader_ip'] = ip
+
+
+# ------------------------------------------------------------------------------
+# Gets the corresponding ip-address+port as the new leader (returns tuple)
+# ------------------------------------------------------------------------------
+def get_leader():
+  leader_ip = fmap_lock('leader_lock', _get_leader, [])
+  return leader_ip.split(':')
+
+# NOTE: helper function - not thread-safe!
+def _get_leader():
+  return mycontext['leader_ip']
+
+# ------------------------------------------------------------------------------
+# Returns the id of the current leader 
+# ------------------------------------------------------------------------------
+def get_leader_id():
+  return fmap_lock('leader_lock', _get_leader_id, [])  
+
+# NOTE: helper function - not thread-safe!
+def _get_leader_id():
+  return mycontext['leader']
+
+# ------------------------------------------------------------------------------
+# POST /leader/election
+#    called when the previous neighbor/node sends an election message
+# ------------------------------------------------------------------------------
+def election_handler(sockobj, params, query_params):
+  ids = _decode_list(params['ids'], typeFunc=int)
+  ips = _decode_list(params['ips'], typeFunc=str)
+  source = params['source']
+
+  me = "%s:%i" % (mycontext['ip'], mycontext['port'])
+
+  # Prevent circulating packets, this should never occur if
+  # all neighbors delivers as it should (ie. no down)
+  if mycontext['id'] in ids and source != me:
+    log('Packet accidentally circulated more than once, throwing away ..')
+    return
+
+  if source != me:
+    ids.append(mycontext['id'])
+    ips.append(me)
+    _election_propagate(source, ids, ips)
+  else:
+    leader_id = min(ids)
+    index = ids.index(leader_id)
+    leader_ip = ips[index]
+
+    leader_elect(leader_id, leader_ip)
+
+    log('ids available %s' % ids)
+    log('%i chosen as leader. (election)' % leader_id)
+    _coordinate_propagate(leader_id, leader_ip, me)
+
+
+# ------------------------------------------------------------------------------
+# Forward the neighbor_ids received to the next neighbor for the leader
+# election process.
+# ------------------------------------------------------------------------------
+def _election_propagate(source, ids, ips):
+  body = {'ids': _encode_list(ids), 'ips': _encode_list(ips), 'source': source}
+
+  request_body = http_generate_body_from_dict(body)
+  request = http_generate_request('POST', '/leader/election', request_body)
+  send_next_neighbor(request)
+
+
+def _encode_list(lst):
+  return ','.join(map(str, lst))
+
+def _decode_list(lst, typeFunc=int):
+  return map(typeFunc, lst.split(','))
+
+
+# ------------------------------------------------------------------------------
+# POST /leader/coordinate
+#    called when the previous neighbor/node sends a coordination message
+# ------------------------------------------------------------------------------
+def coordinate_handler(sockobj, params, query_params):
+  leader_id = int(params['id'])
+  leader_ip = params['ip']
+  source = params['source']
+
+  me = "%s:%i" % (mycontext['ip'], mycontext['port'])
+  leader_elect(leader_id, leader_ip)
+  log('elected new leader %d (%s)' % (leader_id, leader_ip))
+
+  if source != me:
+    _coordinate_propagate(leader_id, leader_ip, source)
+
+
+# ------------------------------------------------------------------------------
+# Forward the leader id received to the next neighbor for the leader
+# election process.
+# ------------------------------------------------------------------------------
+def _coordinate_propagate(leader_id, leader_ip, source):
+  body = {'id': str(leader_id), 'source': source, 'ip': leader_ip}
+
+  request_body = http_generate_body_from_dict(body)
+  request = http_generate_request('POST', '/leader/coordinate', request_body)
+  send_next_neighbor(request)
+
+
+# ------------------------------------------------------------------------------
+# Send a specific http-request to the next neighbor.
+#   If there occurs an error when sending to the closest neighbor,
+#   try again but send to the next until successful.
+# ------------------------------------------------------------------------------
+def send_next_neighbor(request):
+  sent = False
+  offset = 1
+  while not sent:
+    ip, port = _get_neighbor(offset)
+    try:
+      http_send(ip, port, request)
+      sent = True
+      break
+    except Exception, e:
+      # Move on to the next in list!
+      offset = offset + 1
+      continue
+
+
+# ------------------------------------------------------------------------------
+# Get the next neighbor in the ring (with a specific offset
+# if previous communication fails)
+# ------------------------------------------------------------------------------
+def _get_neighbor(offset=1):
+  neighbors = mycontext['neighbors']
+  self_index = neighbors.index((mycontext['ip'], mycontext['port']))
+  neighbor_index = (self_index + offset) % len(neighbors)
+  return neighbors[neighbor_index]

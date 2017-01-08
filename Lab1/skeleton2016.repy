@@ -1,0 +1,155 @@
+include httpUtils.repy
+
+# ------------------------------------------------------------------------------   
+# Start listening and handle incoming connections in board() function
+# ------------------------------------------------------------------------------   
+def start_board():
+  ip = mycontext['ip']
+  port = mycontext['port']
+  print "Listening on IP " + str(ip) + " port " + str(port)
+  try: 
+    listencommhandle = waitforconn(ip, port, board_connection_handler)
+  except Exception, e:
+    print "Exception in start_board: %s, %s\n" %(type(e), e)
+    raise
+
+# ------------------------------------------------------------------------------    
+# Called when an incoming message is received. 
+# ------------------------------------------------------------------------------    
+def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle):
+  try:
+    msg = sockobj.recv(1024) 
+    print msg 
+    method, action = get_method_and_action(msg)
+    # React depending on HTTP method
+    if method == 'GET' :
+      get_board_handler(sockobj)
+    elif method == 'POST':
+      post_board_handler(msg, action, sockobj)
+      send_update_to_peers(msg)
+    elif method == 'UPDATE' :
+      post_board_handler(msg, action, sockobj)
+  except Exception as e:
+    print "Exception in board: %s, %s\n" %(type(e), e)
+    raise
+  finally:
+    stopcomm(thiscommhandle)
+
+# ------------------------------------------------------------------------------
+# Returns method and action from HTTP request
+# ------------------------------------------------------------------------------
+def get_method_and_action(msg):
+  split = msg.split(' ', 2) 
+  return (split[0], split[1])
+
+# ------------------------------------------------------------------------------
+# Converts a POST request into an UPDATE and sends it to all neighbors
+# ------------------------------------------------------------------------------
+def send_update_to_peers(msg):
+  msg = msg.replace('POST', 'UPDATE')
+  for ip, port in mycontext['neighbors']:
+    try:
+      socket = openconn(ip, port)
+      socket.send(msg)
+      socket.close()
+    except:
+      print 'Could not contact ' + ip + ':' + str(port)
+
+# ------------------------------------------------------------------------------
+# Handles initial GET request from browser
+# ------------------------------------------------------------------------------
+def get_board_handler(sockobj):
+  res = generate_html_response()
+  sockobj.send(res)
+
+# ------------------------------------------------------------------------------
+# Handles all the incoming POST requests from the browser
+# ------------------------------------------------------------------------------
+def post_board_handler(msg, action, sockobj):
+  try:
+    params = extract_params_from_body(msg)
+    if action == '/board': 
+      add_entry(params)
+    elif action.startswith('/entries'): 
+      modify_entry(params, action)
+    res = generate_response(msg, True)
+  except:
+    res = generate_response(msg, False)
+  finally:
+    sockobj.send(res)
+
+# ------------------------------------------------------------------------------
+# Adds a new entry to the blackboard 
+# ------------------------------------------------------------------------------
+def add_entry(params): 
+  text = params['entry']
+  msgid = mycontext['msgid'] = mycontext['msgid'] + 1
+  entry = mycontext['entry_template'] % ('entries/%d' % (msgid), msgid, text)
+  mycontext['entries'][msgid] = entry
+  
+# ------------------------------------------------------------------------------
+# Modifies or deletes an already existing entry 
+# ------------------------------------------------------------------------------
+def modify_entry(params, action):
+  id = int(action[-1])
+  if params['delete'] == '1': 
+    if id in mycontext['entries']:
+      del mycontext['entries'][id]
+  else:
+    mycontext['entries'][id] = mycontext['entry_template'] % ('entries/%d' % (id), id, params['entry'])
+
+# ------------------------------------------------------------------------------    
+# Initalizes global variables and calls start_board() to start listening for conns
+# ------------------------------------------------------------------------------    
+def init():
+  # Check the number of arguments given
+  if len(callargs) == 1 or len(callargs) == 2:
+    port = int(callargs[0])
+    if len(callargs) == 2:
+      ip=str(callargs[1])
+    else:
+      try:
+        ip = getmyip()
+      except Exception, e:
+        print "Could not get an IP\n"
+        print (type(e), e)
+        raise
+  else:
+    raise Exception("Usage: python <path to repy.py> <path to restrictions.default> skeleton2016.repy <port> [ip (optional)]")
+  
+  # This dictionary will hold all the messages posted to the blackboard 
+  mycontext['entries'] = {} 
+  mycontext['msgid'] = 0 # Used as key in the dictionary
+  
+  mycontext['port'] = port
+  mycontext['ip'] = ip
+
+  # Read and store the ip and port number of neighbors
+  mycontext['neighbors'] = []
+  f = open('neighborlist.txt', 'r')
+  for line in f:
+    addr_info = line.split(':')
+    ip = addr_info[0]
+    port = int(addr_info[1].rstrip())
+	  # We do not want to add ourselves
+    if ip == mycontext['ip'] and port == mycontext['port']: 
+      continue
+    mycontext['neighbors'].append( (ip, port) )
+  f.close()
+
+  # Read html template files
+  mycontext['response_template'] = file("response_template.html").read()
+  mycontext['entry_template'] = file("entry_template.html").read()
+  mycontext['boardcontents_template'] = file("boardcontents_template.html").read()
+  mycontext['frontpage_header_template'] = file("board_frontpage_header_template.html").read()
+  mycontext['frontpage_footer_template'] = file("board_frontpage_footer_template.html").read()
+
+  mycontext['authors'] = "Filip Nilsson"
+  start_board()
+ 
+# ------------------------------------------------------------------------------    
+# Main entry point of the program.
+# ------------------------------------------------------------------------------
+if callfunc == 'initialize':
+  init()
+

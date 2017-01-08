@@ -1,0 +1,319 @@
+include http-utils.repy
+include http-server.repy
+include byzantine_behavior.repy
+
+# ------------------------------------------------------------------------------
+# GET / 
+# ------------------------------------------------------------------------------
+def get_homepage(sockobj, params, queryParams):
+  sockobj.send(make_http_response(200, 'OK', mycontext['frontpage_template']))
+  
+
+# ------------------------------------------------------------------------------
+# GET /vote/result 
+# ------------------------------------------------------------------------------
+def get_result(sockobj, params, queryParams):
+  result = mycontext.get('last_result')
+  if result is None:
+    result = 'NONE'
+
+  last_stage2 = mycontext.get('last_stage2')
+  if last_stage2 is None:
+    last_stage2 = {}
+
+  # Generate some html containing the results from stage 2
+  html = ''
+  for ip, vector in last_stage2.items():
+    html = html + '%s: %s<br/>' % (ip, _encode_list(vector))
+
+  html = html + 'Last result=%s' % result
+  sockobj.send(make_http_response(200, 'OK', html))
+
+
+# ------------------------------------------------------------------------------
+# POST /vote/attack 
+# ------------------------------------------------------------------------------
+def post_attack(sockobj, params, queryParams):
+  if mycontext['current_stage'] != None:
+    sockobj.send(make_http_response(200, 'OK', 'Not ready with last voting round'))
+    return
+
+  fmap_lock('voting_lock', init_stage1, ['ATTACK'])
+  sockobj.send(make_http_response(200, 'OK', 'attack'))
+
+
+# ------------------------------------------------------------------------------
+# POST /vote/retreat 
+# ------------------------------------------------------------------------------
+def post_retreat(sockobj, params, queryParams):
+  if mycontext['current_stage'] != None:
+    sockobj.send(make_http_response(200, 'OK', 'Not ready with last voting round'))
+    return 
+
+  fmap_lock('voting_lock', init_stage1, ['RETREAT'])
+  sockobj.send(make_http_response(200, 'OK', 'retreat'))
+
+
+# ------------------------------------------------------------------------------
+# POST /vote/byzantine 
+# ------------------------------------------------------------------------------
+def post_byzantine(sockobj, params, queryParams):
+  if mycontext['current_stage'] != None:
+    sockobj.send(make_http_response(200, 'OK', 'Not ready with last voting round'))
+    return
+
+  fmap_lock('voting_lock', init_stage1, ['BYZANTINE'])
+  sockobj.send(make_http_response(200, 'OK', 'byzantine'))
+
+
+# ------------------------------------------------------------------------------
+# Initialize stage 1 of the byzantine voting
+# ------------------------------------------------------------------------------
+def init_stage1(state):
+  log('initializes with state=%s' % state)
+  mycontext['state'] = state
+  mycontext['current_stage'] = 'stage1'
+
+  source = '%s:%i' % (mycontext['ip'], mycontext['port'])
+  mycontext['stage1_votes'][source] = state
+
+  if state == 'BYZANTINE':
+    byzantine_stage1(source)
+  else:
+    http_broadcast('POST', '/result/stage1', {'vote':state,'source':source})
+
+  # If this is the last of the vessels to receive its
+  # state - we've already received the votes/state of
+  # the other vessels and thus must proceed to stage 2.
+  check_should_proceed_stage2()
+
+
+# ------------------------------------------------------------------------------
+# POST /result/stage1 
+# ------------------------------------------------------------------------------
+def post_stage1(sockobj, params, queryParams):
+  mycontext['voting_lock'].acquire()
+  source = params['source']
+  vote = params['vote']
+
+  mycontext['stage1_votes'][source] = vote
+  check_should_proceed_stage2()
+
+  mycontext['voting_lock'].release()
+
+
+# ------------------------------------------------------------------------------
+# Determine whether we're safe to proceed to stage 2 of the byzantine
+# voting or not (and actually proceed).
+#
+# NOTE: not thread-safe
+# ------------------------------------------------------------------------------
+def check_should_proceed_stage2():
+  isStage1 = mycontext['current_stage'] == 'stage1'
+  recvVotes = len(mycontext['stage1_votes'])
+
+  if isStage1 and recvVotes == mycontext['num_nodes']:
+    mycontext['current_stage'] = 'stage2'
+    init_stage2()
+
+
+# ------------------------------------------------------------------------------
+# Initialize stage 2 of the byzantine voting
+# ------------------------------------------------------------------------------
+def init_stage2():
+  ips = mycontext['stage1_votes'].keys()
+
+  if mycontext['state'] == 'BYZANTINE':
+    byzantine_stage2(ips)
+  else:
+    votes = mycontext['stage1_votes'].values()
+    body = {'votes':_encode_list(votes),'ips':_encode_list(ips)}
+    http_broadcast('POST', '/result/stage2', body)
+
+
+# ------------------------------------------------------------------------------
+# POST /result/stage2 
+# ------------------------------------------------------------------------------
+def post_stage2(sockbj, params, queryParams):
+  mycontext['voting_lock'].acquire()
+  votes = _decode_list(params['votes'])
+  ips = _decode_list(params['ips'])
+
+  # Sort the votes received by ip
+  for i, ip in enumerate(ips):
+    result_vector = mycontext['stage2_votes'].get(ip)
+    if result_vector is None:
+      result_vector = []
+    result_vector.append(votes[i])
+    mycontext['stage2_votes'][ip] = result_vector 
+
+  num_responses = len(mycontext['stage2_votes'].values()[0])
+  if num_responses == mycontext['num_nodes'] - 1:
+    # Get the majority results for each source/vessel
+    majority_results = map(get_majority, mycontext['stage2_votes'].values())
+    # Get the majority of majority between the vessels/sources
+    result = get_majority(majority_results)
+
+    # Save the results
+    mycontext['last_result'] = result
+    mycontext['last_stage2'] = mycontext['stage2_votes']
+
+    log('got result %s' % result)
+    reset_voting()
+
+  mycontext['voting_lock'].release()
+
+
+# Helpers for sending lists through http
+def _encode_list(lst):
+  return ','.join(map(str, lst))
+def _decode_list(lst, typeFunc=str):
+  return map(typeFunc, lst.split(','))
+
+
+# ------------------------------------------------------------------------------
+# Calculate the majority of votes, valid values in votes is 
+# {ATTACK,RETREAT}
+# ------------------------------------------------------------------------------
+def get_majority(votes):
+  retreat = 0
+  attacks = 0
+  for vote in votes:
+    if vote == 'RETREAT':
+      retreat = retreat + 1
+    elif vote == 'ATTACK':
+      attacks = attacks + 1
+
+  if attacks >= retreat:
+    return 'ATTACK'
+  else:
+    return 'RETREAT'
+
+
+# ------------------------------------------------------------------------------
+# Resets the voting variables to the initial state
+# ------------------------------------------------------------------------------
+def reset_voting():
+  mycontext['state'] = None
+  mycontext['current_stage'] = None
+  mycontext['stage2_votes'] = {}
+  mycontext['stage1_votes'] = {}
+
+# ------------------------------------------------------------------------------
+# Function map with safe surrounding lock acquiring and release
+# ------------------------------------------------------------------------------
+def fmap_lock(lockName, func, params):
+  mycontext[lockName].acquire()
+  retVal = None
+  try:
+    retVal = func(*params)
+  except Exception, e:
+    log("Exception in critical section (lock %s): %s, %s\n" %(lockName, type(e), e))
+  finally:
+    mycontext[lockName].release()
+    return retVal
+
+
+# ------------------------------------------------------------------------------
+# Log a message with extra relevant information - such as the current ip+port
+# in order to distinguish a difference between what each vessel/machine logs.
+# ------------------------------------------------------------------------------
+def log(s):
+  print '%f %s:%i@> %s' % (getruntime(), mycontext['ip'], mycontext['port'], s)
+
+
+# ------------------------------------------------------------------------------
+# Parses the neighborlist file and detects neighbors
+#   NOTE: assumes that mycontext['ip'] and mycontext['port'] is set.
+# ------------------------------------------------------------------------------
+def read_neighbors_from_file(filename):
+  f = open(filename, 'r')
+
+  neighbors = []
+  for line in f:
+    addr_info = line.split(':')
+    ip = addr_info[0]
+    port = int(addr_info[1].rstrip())
+    if not (ip == mycontext['ip'] and port == mycontext['port']):
+      neighbors.append( (ip, port) )
+
+  f.close()
+  return neighbors
+
+
+# ------------------------------------------------------------------------------
+# Emulates the behaviour of python built-in enumerate, but tailor-made
+# to work in repy.
+# ------------------------------------------------------------------------------
+def enumerate(sequence, start=0):
+  n = start
+  ret = []
+  for elem in sequence:
+    ret.append((n, elem))
+    n += 1
+
+  return ret
+
+
+# ------------------------------------------------------------------------------
+# Initalizes global variables and calls start_board() to start listening for conns
+# ------------------------------------------------------------------------------
+def init():
+  # Check the number of arguments given
+  if len(callargs) == 1 or len(callargs) == 2:
+    port = int(callargs[0])
+    if len(callargs) == 2:
+      ip=str(callargs[1])
+    else:
+      try:
+        ip = getmyip()
+      except Exception, e:
+        print "Could not get an IP\n"
+        print (type(e), e)
+        raise
+  else:
+    raise Exception("Usage: python <path to repy.py> <path to restrictions.default> skeleton2016.repy <port> [ip (optional)]")
+
+  mycontext['port'] = port
+  mycontext['ip'] = ip
+  mycontext['neighbors'] = read_neighbors_from_file('neighborlist.txt')
+
+  mycontext['voting_lock'] = getlock()
+
+  mycontext['num_nodes'] = 4
+  mycontext['num_honest_nodes'] = 3
+  reset_voting()
+
+  # Read and store the ip and port number of neighbors
+  mycontext['authors'] = "Filip Nilsson (filipni(at)student), Sebastian Lund (selund(at)student)"
+
+  load_templates()
+
+  http_server_init()
+
+  # Primary board http handlers
+  http_server_register_handler('GET', '/', get_homepage)
+  http_server_register_handler('POST', '/vote/attack', post_attack)
+  http_server_register_handler('POST', '/vote/retreat', post_retreat)
+  http_server_register_handler('POST', '/vote/byzantine', post_byzantine)
+  http_server_register_handler('POST', '/result/stage1', post_stage1)
+  http_server_register_handler('POST', '/result/stage2', post_stage2)
+  http_server_register_handler('GET', '/vote/result', get_result)
+
+  http_server_start()
+
+
+# ------------------------------------------------------------------------------
+# Load all html templates into mycontext
+# ------------------------------------------------------------------------------
+def load_templates():
+  # Read html template files
+  mycontext['frontpage_template'] = file("vote_frontpage_template.html").read()
+  mycontext['result_template'] = file("vote_result_template.html").read()
+
+
+# ------------------------------------------------------------------------------
+# Main entry point of the program.
+# ------------------------------------------------------------------------------
+if callfunc == 'initialize':
+  init()

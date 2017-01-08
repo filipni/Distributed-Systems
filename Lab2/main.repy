@@ -1,0 +1,253 @@
+include http-utils.repy
+include http-server.repy
+include leader-election.repy
+
+# ------------------------------------------------------------------------------
+# GET /board & /
+#   Handles initial GET request from browser
+# ------------------------------------------------------------------------------
+def get_board_handler(sockobj, params, query_params):
+  res = generate_html_response()
+  sockobj.send(res)
+
+
+# ------------------------------------------------------------------------------
+# POST /entries
+#   Leader adds new entry to blackboard and broadcasts this entry to all other nodes
+# ------------------------------------------------------------------------------
+def new_entry_handler(sockobj, params, query_params):
+  if leader_election_is_done():
+    text = params['entry']
+
+    if is_leader():
+      id = fmap_lock('entries_lock', add_entry, [text])
+      body = {'id': id, 'entry': text}
+      broadcast_entry('POST', '/broadcast/entries', body)
+    else:
+      send_to_leader('POST', '/entries', params)
+
+    ip, port = get_leader()
+    response_msg = 'Leader is ' + ip + ':' + port + " Id: " + str(get_leader_id())
+    sockobj.send(make_http_response(200, 'OK', response_msg))
+  else:
+    sockobj.send(make_http_response(400, 'Bad Request', 'Leader election not done yet.'))
+
+
+# ------------------------------------------------------------------------------
+# POST /broadcast/entries
+#   Updates local blackboard with new entry from leader
+# ------------------------------------------------------------------------------
+def new_entry_broadcast_handler(sockobj, params, query_params):
+  id = int(params['id'])
+  text = params['entry']
+  fmap_lock('entries_lock', add_entry, [text, id])
+
+
+# ------------------------------------------------------------------------------
+# POST /entries/:id
+#   Leader modifies or deletes an already existing entry and
+#   broadcasts the changes to all other nodes
+# ------------------------------------------------------------------------------
+def modify_entry_handler(sockobj, params, query_params):
+  params['id'] = query_params[-1]
+  if is_leader():
+    params['timestamp'] = getruntime()
+    modify_entry_broadcast_handler(sockobj, params, query_params)
+    broadcast_entry('POST', '/broadcast/entries/' + params['id'], params)
+  else:
+    send_to_leader('POST', '/entries/' + params['id'], params)
+
+  ip, port = get_leader()
+  response_msg = 'Leader is ' + ip + ':' + port + " Id: " + str(get_leader_id())
+  sockobj.send(make_http_response(200, 'OK', response_msg))
+
+# ------------------------------------------------------------------------------
+# POST /broadcast/entries/:id
+#  Modifies local blackboard according to message from leader
+# ------------------------------------------------------------------------------
+def modify_entry_broadcast_handler(sockobj, params, query_params):
+  fmap_lock('timestamps_lock', _modify_entry_broadcast_handler, [sockobj, params, query_params])
+
+def _modify_entry_broadcast_handler(sockobj, params, query_params):
+  id = int(query_params[-1])
+  timestamp = params['timestamp']
+  if params['delete'] == '1':
+    mycontext['update_timestamps'][id] = timestamp 
+    fmap_lock('entries_lock', delete_entry, [id])
+  else:
+    latest_update = mycontext['update_timestamps'].get(id)
+    # We only want to change the entry if we get an update that is newer than the previous one
+    if latest_update == None or latest_update < timestamp:
+      mycontext['update_timestamps'][id] = timestamp
+      fmap_lock('entries_lock', modify_entry, [id, params['entry']])
+
+
+# ------------------------------------------------------------------------------
+# Generates and sends a HTTP request to the elected leader
+# ------------------------------------------------------------------------------
+def send_to_leader(method, action, params):
+  request_body = http_generate_body_from_dict(params)
+  request = http_generate_request(method, action, request_body)
+  ip, port = get_leader()
+  try:
+    http_send(ip, int(port), request)
+  except Exception, e:
+    # Leader probably down, reinitiate the leader-election
+    log('could not reach leader, electing new one; discarding this message')
+    leader_election_reset()
+
+
+# ------------------------------------------------------------------------------
+# Broadcasts a message to all other nodes
+# ------------------------------------------------------------------------------
+def broadcast_entry(method, action, params):
+  request_body = http_generate_body_from_dict(params)
+  request = http_generate_request(method, action, request_body)
+
+  for ip, port in mycontext['neighbors']:
+    if not (ip == mycontext['ip'] and port == mycontext['port']):
+      try:
+        http_send(ip, port, request)
+      except Exception, e:
+        log('neighbor %s:%d is down' % (ip, port))
+
+
+# ------------------------------------------------------------------------------
+# Adds an entirely new entry to the entries list
+# ------------------------------------------------------------------------------
+def add_entry(text, msgid=None):
+  if msgid is None:
+    msgid = mycontext['msgid'] = mycontext['msgid'] + 1
+
+  if mycontext['msgid'] < msgid:
+    mycontext['msgid'] = msgid
+
+  entry = mycontext['entry_template'] % ('entries/%d' % (msgid), msgid, text)
+  mycontext['entries'][msgid] = entry
+  return msgid
+
+
+# ------------------------------------------------------------------------------
+# Deletes an entry with a specific id from the entries list.
+# ------------------------------------------------------------------------------
+def delete_entry(id):
+  if id in mycontext['entries']:
+    del mycontext['entries'][id]
+
+
+# ------------------------------------------------------------------------------
+# Modifies an already existing entry in the entries list
+# ------------------------------------------------------------------------------
+def modify_entry(id, text):
+  if id in mycontext['entries']:
+    mycontext['entries'][id] = mycontext['entry_template'] % ('entries/%d' % (id), id, text)
+
+
+# ------------------------------------------------------------------------------
+# Function map with safe surrounding lock acquiring and release
+# ------------------------------------------------------------------------------
+def fmap_lock(lockName, func, params):
+  mycontext[lockName].acquire()
+  retVal = None
+  try:
+    retVal = func(*params)
+  except Exception, e:
+    print "Exception in critical section: %s, %s\n" %(type(e), e)
+  finally:
+    mycontext[lockName].release()
+    return retVal
+
+
+# ------------------------------------------------------------------------------
+# Log a message with extra relevant information - such as the current ip+port
+# in order to distinguish a difference between what each vessel/machine logs.
+# ------------------------------------------------------------------------------
+def log(s):
+  print '%s:%i@> %s' % (mycontext['ip'], mycontext['port'], s)
+
+
+# ------------------------------------------------------------------------------
+# Parses the neighborlist file and detects neighbors
+#   NOTE: assumes that mycontext['ip'] and mycontext['port'] is set.
+# ------------------------------------------------------------------------------
+def read_neighbors_from_file(filename):
+  f = open(filename, 'r')
+
+  neighbors = []
+  for line in f:
+    addr_info = line.split(':')
+    ip = addr_info[0]
+    port = int(addr_info[1].rstrip())
+    neighbors.append( (ip, port) )
+
+  f.close()
+  return neighbors
+
+
+# ------------------------------------------------------------------------------
+# Initalizes global variables and calls start_board() to start listening for conns
+# ------------------------------------------------------------------------------
+def init():
+  # Check the number of arguments given
+  if len(callargs) == 1 or len(callargs) == 2:
+    port = int(callargs[0])
+    if len(callargs) == 2:
+      ip=str(callargs[1])
+    else:
+      try:
+        ip = getmyip()
+      except Exception, e:
+        print "Could not get an IP\n"
+        print (type(e), e)
+        raise
+  else:
+    raise Exception("Usage: python <path to repy.py> <path to restrictions.default> skeleton2016.repy <port> [ip (optional)]")
+
+  # This dictionary will hold all the messages posted to the blackboard
+  mycontext['entries'] = {}
+  mycontext['entries_lock'] = getlock()
+  mycontext['msgid'] = 0 # Used as key in the dictionary
+
+  mycontext['port'] = port
+  mycontext['ip'] = ip
+  mycontext['neighbors'] = read_neighbors_from_file('neighborlist.txt')
+
+  # Read and store the ip and port number of neighbors
+  mycontext['authors'] = "Filip Nilsson (filipni(at)student), Sebastian Lund (selund(at)student)"
+
+  # Dictionary used to see if an update to an entry is outdated
+  mycontext['update_timestamps'] = {}
+  mycontext['timestamps_lock'] = getlock()
+
+  load_templates()
+
+  http_server_init()
+
+  # Primary board http handlers
+  http_server_register_handler('GET', '/', get_board_handler)
+  http_server_register_handler('GET', '/board', get_board_handler)
+  http_server_register_handler('POST', '/entries', new_entry_handler)
+  http_server_register_handler('POST', '/entries/:id', modify_entry_handler)
+  http_server_register_handler('POST', '/broadcast/entries', new_entry_broadcast_handler)
+  http_server_register_handler('POST', '/broadcast/entries/:id', modify_entry_broadcast_handler)
+
+  leader_election_init()
+  http_server_start()
+
+
+# ------------------------------------------------------------------------------
+# Load all html templates into mycontext
+# ------------------------------------------------------------------------------
+def load_templates():
+  # Read html template files
+  mycontext['response_template'] = file("response_template.html").read()
+  mycontext['entry_template'] = file("entry_template.html").read()
+  mycontext['boardcontents_template'] = file("boardcontents_template.html").read()
+  mycontext['frontpage_header_template'] = file("board_frontpage_header_template.html").read()
+  mycontext['frontpage_footer_template'] = file("board_frontpage_footer_template.html").read()
+
+# ------------------------------------------------------------------------------
+# Main entry point of the program.
+# ------------------------------------------------------------------------------
+if callfunc == 'initialize':
+  init()
